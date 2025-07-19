@@ -1,14 +1,7 @@
 {
-  "name": "server",
-  "version": "1.0.0",
-  "description": "A backend server for ai.",
-  "main": "server.js",
   "scripts": {
-    "start": "NODE_NO_WARNINGS=1 node server.js",
-    "dev": "nodemon server.js"
+    "start": "node index.js"
   },
-
-{
   "dependencies": {
     "@dotenvx/dotenvx": "^1.47.6",
     "@google/generative-ai": "^0.24.1",
