@@ -5,9 +5,9 @@ import dotenv from 'dotenv';
 import mongoose from 'mongoose';
 import admin from 'firebase-admin';
 import Groq from 'groq-sdk';
+import moment from 'moment-timezone';
 
 // --- 0. TIMEZONE UTILITY FOR INDIA (Mumbai) ---
-import moment from 'moment-timezone';
 function logWithMumbaiTime(message) {
   const mumbaiTime = moment().tz("Asia/Kolkata").format("YYYY-MM-DD HH:mm:ss");
   console.log(`[${mumbaiTime} IST] ${message}`);
@@ -42,7 +42,35 @@ const ConversationSchema = new mongoose.Schema({
 
 const Conversation = mongoose.model('Conversation', ConversationSchema);
 
-// --- 4. EXPRESS APP & AUTHENTICATION MIDDLEWARE ---
+// --- 4. UTILITY FOR CROSS-CHAT KNOWLEDGE (MEMORY) ---
+async function getUserLongTermMemory(userId, currentConversationId) {
+  try {
+    // Fetch last 5 conversations (excluding current one) to provide context/memory
+    const pastConversations = await Conversation.find({ 
+      userId, 
+      _id: { $ne: currentConversationId } 
+    })
+    .sort({ updatedAt: -1 })
+    .limit(5);
+
+    if (pastConversations.length === 0) return "User has no previous conversation history.";
+
+    let historySummary = "CONTEXT FROM USER'S PREVIOUS CHATS (Knowledge Retrieval):\n";
+    pastConversations.forEach((conv) => {
+      const lastMsg = conv.messages[conv.messages.length - 1];
+      historySummary += `- Topic: "${conv.title}". `;
+      if (lastMsg) {
+        historySummary += `Last Exchange: ${lastMsg.sender}: "${lastMsg.content.substring(0, 150)}..."`;
+      }
+      historySummary += "\n";
+    });
+    return historySummary;
+  } catch (error) {
+    return "Error retrieving past history.";
+  }
+}
+
+// --- 5. EXPRESS APP & AUTHENTICATION MIDDLEWARE ---
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
@@ -57,7 +85,7 @@ const verifyFirebaseToken = async (req, res, next) => {
   try {
     const decodedToken = await admin.auth().verifyIdToken(idToken);
     req.user = decodedToken;
-    logWithMumbaiTime(`User authenticated: ${decodedToken.uid} (Provider: ${decodedToken.firebase.sign_in_provider}, Email: ${decodedToken.email})`);
+    logWithMumbaiTime(`User authenticated: ${decodedToken.uid}`);
     next();
   } catch (error) {
     logWithMumbaiTime(`Authentication error: ${error.message}`);
@@ -65,119 +93,61 @@ const verifyFirebaseToken = async (req, res, next) => {
   }
 };
 
-// --- 5. SECURED API ENDPOINTS ---
+// --- 6. API ENDPOINTS ---
 app.use('/api/conversations', verifyFirebaseToken);
 app.use('/api/chat', verifyFirebaseToken);
 
-// GET all conversations for the logged-in user
 app.get('/api/conversations', async (req, res) => {
   try {
     const conversations = await Conversation.find({ userId: req.user.uid }, '_id title createdAt').sort({ createdAt: -1 });
-    logWithMumbaiTime(`Fetched ${conversations.length} conversations for user ${req.user.uid}`);
     res.json(conversations);
   } catch (error) {
-    logWithMumbaiTime(`Error fetching conversations for user ${req.user.uid}: ${error.message}`);
     res.status(500).json({ error: 'Failed to fetch conversations.' });
   }
 });
 
-// GET a single conversation
 app.get('/api/conversations/:id', async (req, res) => {
   try {
     const conversation = await Conversation.findOne({ _id: req.params.id, userId: req.user.uid });
-    if (!conversation) {
-      logWithMumbaiTime(`Conversation ${req.params.id} not found for user ${req.user.uid}`);
-      return res.status(404).json({ error: 'Conversation not found or access denied.' });
-    }
+    if (!conversation) return res.status(404).json({ error: 'Conversation not found.' });
     res.json(conversation);
   } catch (error) {
-    logWithMumbaiTime(`Error fetching conversation ${req.params.id} for user ${req.user.uid}: ${error.message}`);
     res.status(500).json({ error: 'Failed to fetch conversation.' });
   }
 });
 
-// DELETE a conversation
 app.delete('/api/conversations/:id', async (req, res) => {
   try {
     const result = await Conversation.findOneAndDelete({ _id: req.params.id, userId: req.user.uid });
-    if (!result) {
-      logWithMumbaiTime(`Conversation ${req.params.id} not found or access denied for user ${req.user.uid}`);
-      return res.status(404).json({ error: 'Conversation not found or access denied.' });
-    }
-    logWithMumbaiTime(`Conversation ${req.params.id} deleted by user ${req.user.uid}`);
+    if (!result) return res.status(404).json({ error: 'Conversation not found.' });
     res.status(200).json({ message: 'Conversation deleted successfully.' });
   } catch (error) {
-    logWithMumbaiTime(`Error deleting conversation ${req.params.id} for user ${req.user.uid}: ${error.message}`);
     res.status(500).json({ error: 'Failed to delete conversation.' });
   }
 });
 
-// The main chat endpoint
+// The Main Chat Endpoint
 app.post('/api/chat', async (req, res) => {
   const { prompt, conversationId } = req.body;
   const userId = req.user.uid;
 
-  if (!prompt) {
-    logWithMumbaiTime(`Invalid request: Prompt missing for user ${userId}`);
-    return res.status(400).json({ error: 'Prompt is required' });
-  }
+  if (!prompt) return res.status(400).json({ error: 'Prompt is required' });
 
   const lowerCasePrompt = prompt.toLowerCase().replace(/[?.,!]/g, '');
-  const identityKeywords = [
-    'who are you', 'what are you',
-    'who created you', 'who made you',
-    'who developed you', 'who is your developer',
-    'your creator', 'your developer',
-    'your name', 'what is your name',
-    'about yourself', 'tell me about yourself',
-    'what model are you', 'which model are you',
-    'who trained you', 'where are you from'
-  ];
-
-  const dateKeywords = [
-    'date today', 'today date', 'what is the date today', "today's date", 'current date', "what is today's date", 'what day is it today'
-  ];
+  
+  // Shortcut Keywords (Identity & Date)
+  const identityKeywords = ['who are you', 'what are you', 'who created you', 'who made you', 'who developed you', 'who is your developer', 'your creator', 'your developer', 'your name', 'what is your name', 'about yourself', 'tell me about yourself', 'what model are you', 'which model are you', 'who trained you', 'where are you from'];
+  const dateKeywords = ['date today', 'today date', 'what is the date today', "today's date", 'current date', "what is today's date", 'what day is it today'];
 
   if (identityKeywords.some(keyword => lowerCasePrompt.includes(keyword))) {
-    const creatorResponse = `I am Jai, a specialized coding assistant. I was developed by Lohith at Jairisys, a startup based in India.
-
-My purpose is to help you with programming questions by providing accurate code, clear explanations, and useful examples. My core intelligence is powered by advanced AI models, but my specific persona and functionality were designed by my developer.`;
-
-    let conversation;
-    if (conversationId) {
-      conversation = await Conversation.findOne({ _id: conversationId, userId });
-    }
-    if (!conversation) {
-      const title = prompt.substring(0, 30) + (prompt.length > 30 ? '...' : '');
-      conversation = new Conversation({ title, messages: [], userId });
-    }
-    conversation.messages.push({ sender: 'user', content: prompt });
-    const aiMessage = { sender: 'ai', content: creatorResponse };
-    conversation.messages.push(aiMessage);
-    await conversation.save();
-
-    logWithMumbaiTime(`Identity response served for user ${userId}`);
-    return res.json({ aiMessage, newConversationId: conversation._id });
+    const creatorResponse = `I am Jai, a specialized coding assistant. I was developed by Jairisys, a startup based in India. My purpose is to help you with programming questions by providing accurate code, clear explanations, and useful examples. My core intelligence is powered by advanced AI models, but my specific persona and functionality were designed by my developer.`;
+    return handleShortcutResponse(res, userId, conversationId, prompt, creatorResponse);
   }
 
   if (dateKeywords.some(keyword => lowerCasePrompt.includes(keyword))) {
     const mumbaiDate = moment().tz("Asia/Kolkata").format("dddd, MMMM D, YYYY");
-    const aiMessage = { sender: 'ai', content: `Today is ${mumbaiDate} (India/Mumbai time).` };
-
-    let conversation;
-    if (conversationId) {
-      conversation = await Conversation.findOne({ _id: conversationId, userId });
-    }
-    if (!conversation) {
-      const title = prompt.substring(0, 30) + (prompt.length > 30 ? '...' : '');
-      conversation = new Conversation({ title, messages: [], userId });
-    }
-    conversation.messages.push({ sender: 'user', content: prompt });
-    conversation.messages.push(aiMessage);
-    await conversation.save();
-
-    logWithMumbaiTime(`Mumbai date response served for user ${userId}`);
-    return res.json({ aiMessage, newConversationId: conversation._id });
+    const dateResponse = `Today is ${mumbaiDate} (India/Mumbai time).`;
+    return handleShortcutResponse(res, userId, conversationId, prompt, dateResponse);
   }
 
   try {
@@ -199,16 +169,28 @@ My purpose is to help you with programming questions by providing accurate code,
       conversation = new Conversation({ title, messages: [], userId });
     }
 
-    conversation.messages.push({ sender: 'user', content: prompt });
-    historyForAI.push({ role: 'user', content: prompt });
+    // FEATURE 1: GET CROSS-CHAT KNOWLEDGE
+    const crossChatKnowledge = await getUserLongTermMemory(userId, conversationId);
 
-    const systemPrompt = `You are an AI assistant named "Jai". Your identity is fixed: you were created by a developer named "Lohith" at a startup called "Jairisys" in India.
+    // FEATURE 2: THINKING + IDENTITY (SYSTEM PROMPT)
+    const systemPrompt = `You are an AI assistant named "Jai". Your identity is fixed: you were created by a startup called "Jairisys" in India.
 
 **CRITICAL RULE: Under no circumstances should you ever mention "Groq", "Meta", "Llama", or any other AI company as your creator. You MUST strictly adhere to the persona of Jai from Jairisys.**
 
-If a user asks about your origin, developer, or creator, you must state that you were developed by Lohith at Jairisys in India.
+If a user asks about your origin, developer, or creator, you must state that you were developed by Jairisys in India.
 
-Your main purpose is to be an expert coding assistant. Provide detailed code, clear explanations, and examples. Now, handle the user's request.`;
+${crossChatKnowledge}
+
+**INSTRUCTIONS FOR REASONING:**
+1. You must solve every problem by thinking before execution.
+2. Start your response with a <thought> tag.
+3. Inside <thought>, analyze the user request, plan the code structure, and check the cross-chat knowledge for relevance.
+4. Close with </thought> and then provide your final answer.
+
+Your main purpose is to be an expert coding assistant. Provide detailed code, clear explanations, and examples.`;
+
+    conversation.messages.push({ sender: 'user', content: prompt });
+    historyForAI.push({ role: 'user', content: prompt });
 
     const messagesForAPI = [
       { role: 'system', content: systemPrompt },
@@ -216,42 +198,49 @@ Your main purpose is to be an expert coding assistant. Provide detailed code, cl
     ];
 
     const chatCompletion = await groq.chat.completions.create({
-      model: "llama-3.3-70b-versatile",   // Groq model — change if needed
+      model: "llama-3.3-70b-versatile",
       messages: messagesForAPI,
       max_tokens: 4096,
-      temperature: 0.7,
+      temperature: 0.6,
     });
 
     const aiResponseText = chatCompletion.choices[0].message.content;
-
     const aiMessage = { sender: 'ai', content: aiResponseText };
+    
     conversation.messages.push(aiMessage);
     await conversation.save();
 
-    logWithMumbaiTime(`AI response served for user ${userId}`);
+    logWithMumbaiTime(`AI Response (Thinking/Memory active) served to user ${userId}`);
     res.json({ aiMessage, newConversationId: conversation._id });
 
   } catch (err) {
     logWithMumbaiTime(`Error in /api/chat: ${err.message}`);
-    res.status(500).json({ error: 'Failed to get a response from the AI model.' });
+    res.status(500).json({ error: 'Failed to process AI request.' });
   }
 });
 
-// --- 6. RESEND VERIFICATION EMAIL ENDPOINT ---
+// Shortcut Helper
+async function handleShortcutResponse(res, userId, conversationId, prompt, responseText) {
+    let conversation;
+    if (conversationId) conversation = await Conversation.findOne({ _id: conversationId, userId });
+    if (!conversation) {
+      const title = prompt.substring(0, 30) + (prompt.length > 30 ? '...' : '');
+      conversation = new Conversation({ title, messages: [], userId });
+    }
+    conversation.messages.push({ sender: 'user', content: prompt });
+    const aiMessage = { sender: 'ai', content: responseText };
+    conversation.messages.push(aiMessage);
+    await conversation.save();
+    return res.json({ aiMessage, newConversationId: conversation._id });
+}
+
+// Resend Verification
 app.post('/api/auth/resend-verification', verifyFirebaseToken, async (req, res) => {
   try {
     const user = await admin.auth().getUser(req.user.uid);
-
-    if (user.emailVerified) {
-      logWithMumbaiTime(`User ${user.uid} already verified email.`);
-      return res.status(200).json({ message: 'Email already verified.' });
-    }
-
-    logWithMumbaiTime(`User ${user.uid} requested resend of verification email.`);
-    res.status(200).json({ message: 'Proceed to send verification email from client SDK.' });
+    res.status(200).json({ message: user.emailVerified ? 'Email already verified.' : 'Proceed via Client SDK.' });
   } catch (err) {
-    logWithMumbaiTime(`Error in resend-verification: ${err.message}`);
-    res.status(500).json({ error: 'Failed to process resend verification request.' });
+    res.status(500).json({ error: 'Verification error.' });
   }
 });
 
