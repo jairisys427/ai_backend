@@ -2,9 +2,9 @@ import express from 'express';
 import cors from 'cors';
 import bodyParser from 'body-parser';
 import dotenv from 'dotenv';
-import fetch from 'node-fetch';
 import mongoose from 'mongoose';
 import admin from 'firebase-admin';
+import Groq from 'groq-sdk';
 
 // --- 0. TIMEZONE UTILITY FOR INDIA (Mumbai) ---
 import moment from 'moment-timezone';
@@ -15,7 +15,10 @@ function logWithMumbaiTime(message) {
 
 dotenv.config();
 
-// --- 1. FIREBASE ADMIN & DATABASE SETUP ---
+// --- 1. GROQ CLIENT SETUP ---
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+
+// --- 2. FIREBASE ADMIN & DATABASE SETUP ---
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
@@ -25,21 +28,21 @@ mongoose.connect(process.env.MONGODB_URL)
   .then(() => logWithMumbaiTime('✅ MongoDB connected successfully.'))
   .catch(err => logWithMumbaiTime(`❌ MongoDB connection error: ${err}`));
 
-// --- 2. DATABASE MODELS ---
+// --- 3. DATABASE MODELS ---
 const MessageSchema = new mongoose.Schema({
   sender: { type: String, required: true, enum: ['user', 'ai'] },
   content: { type: String, required: true },
 }, { timestamps: true });
 
 const ConversationSchema = new mongoose.Schema({
-  userId: { type: String, required: true, index: true }, 
+  userId: { type: String, required: true, index: true },
   title: { type: String, required: true },
   messages: [MessageSchema],
 }, { timestamps: true });
 
 const Conversation = mongoose.model('Conversation', ConversationSchema);
 
-// --- 3. EXPRESS APP & AUTHENTICATION MIDDLEWARE ---
+// --- 4. EXPRESS APP & AUTHENTICATION MIDDLEWARE ---
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
@@ -62,7 +65,7 @@ const verifyFirebaseToken = async (req, res, next) => {
   }
 };
 
-// --- 4. SECURED API ENDPOINTS ---
+// --- 5. SECURED API ENDPOINTS ---
 app.use('/api/conversations', verifyFirebaseToken);
 app.use('/api/chat', verifyFirebaseToken);
 
@@ -132,14 +135,14 @@ app.post('/api/chat', async (req, res) => {
   ];
 
   const dateKeywords = [
-    'date today', 'today date', 'what is the date today', 'today\'s date', 'current date', 'what is today\'s date', 'what day is it today'
+    'date today', 'today date', 'what is the date today', "today's date", 'current date', "what is today's date", 'what day is it today'
   ];
 
   if (identityKeywords.some(keyword => lowerCasePrompt.includes(keyword))) {
     const creatorResponse = `I am Jai, a specialized coding assistant. I was developed by Lohith at Jairisys, a startup based in India.
 
 My purpose is to help you with programming questions by providing accurate code, clear explanations, and useful examples. My core intelligence is powered by advanced AI models, but my specific persona and functionality were designed by my developer.`;
-    
+
     let conversation;
     if (conversationId) {
       conversation = await Conversation.findOne({ _id: conversationId, userId });
@@ -184,49 +187,42 @@ My purpose is to help you with programming questions by providing accurate code,
     if (conversationId) {
       conversation = await Conversation.findOne({ _id: conversationId, userId });
       if (conversation) {
-        historyForAI = conversation.messages.map(msg => ({ role: msg.sender, content: msg.content }));
+        historyForAI = conversation.messages.map(msg => ({
+          role: msg.sender === 'ai' ? 'assistant' : 'user',
+          content: msg.content
+        }));
       }
     }
-    
+
     if (!conversation) {
       const title = prompt.substring(0, 30) + (prompt.length > 30 ? '...' : '');
       conversation = new Conversation({ title, messages: [], userId });
     }
-    
+
     conversation.messages.push({ sender: 'user', content: prompt });
     historyForAI.push({ role: 'user', content: prompt });
-    
+
     const systemPrompt = `You are an AI assistant named "Jai". Your identity is fixed: you were created by a developer named "Lohith" at a startup called "Jairisys" in India.
-    
-**CRITICAL RULE: Under no circumstances should you ever mention "Moonshot AI" or any other AI company as your creator. You MUST strictly adhere to the persona of Jai from Jairisys.**
+
+**CRITICAL RULE: Under no circumstances should you ever mention "Groq", "Meta", "Llama", or any other AI company as your creator. You MUST strictly adhere to the persona of Jai from Jairisys.**
 
 If a user asks about your origin, developer, or creator, you must state that you were developed by Lohith at Jairisys in India.
 
 Your main purpose is to be an expert coding assistant. Provide detailed code, clear explanations, and examples. Now, handle the user's request.`;
-    
+
     const messagesForAPI = [
       { role: 'system', content: systemPrompt },
-      ...historyForAI.map(msg => ({ role: msg.role === 'ai' ? 'assistant' : 'user', content: msg.content }))
+      ...historyForAI
     ];
 
-    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: "moonshotai/kimi-k2",
-        messages: messagesForAPI,
-        max_tokens: 4096,
-      })
+    const chatCompletion = await groq.chat.completions.create({
+      model: "llama-3.3-70b-versatile",   // Groq model — change if needed
+      messages: messagesForAPI,
+      max_tokens: 4096,
+      temperature: 0.7,
     });
-    
-    if (!response.ok) {
-      const errorText = await response.text();
-      logWithMumbaiTime(`OpenRouter API Error: ${response.status} ${errorText}`);
-      throw new Error(`API call failed with status: ${response.status}`);
-    }
 
-    const data = await response.json();
-    const aiResponseText = data.choices[0].message.content;
+    const aiResponseText = chatCompletion.choices[0].message.content;
 
     const aiMessage = { sender: 'ai', content: aiResponseText };
     conversation.messages.push(aiMessage);
@@ -241,9 +237,7 @@ Your main purpose is to be an expert coding assistant. Provide detailed code, cl
   }
 });
 
-
-// --- 5. RESEND VERIFICATION EMAIL ENDPOINT ---
-// This endpoint simply verifies the token and confirms that email can be resent via frontend.
+// --- 6. RESEND VERIFICATION EMAIL ENDPOINT ---
 app.post('/api/auth/resend-verification', verifyFirebaseToken, async (req, res) => {
   try {
     const user = await admin.auth().getUser(req.user.uid);
@@ -253,7 +247,6 @@ app.post('/api/auth/resend-verification', verifyFirebaseToken, async (req, res) 
       return res.status(200).json({ message: 'Email already verified.' });
     }
 
-    // Let frontend proceed to call `sendEmailVerification`
     logWithMumbaiTime(`User ${user.uid} requested resend of verification email.`);
     res.status(200).json({ message: 'Proceed to send verification email from client SDK.' });
   } catch (err) {
@@ -262,8 +255,7 @@ app.post('/api/auth/resend-verification', verifyFirebaseToken, async (req, res) 
   }
 });
 
-
-// --- 6. START SERVER ---
+// --- 7. START SERVER ---
 app.listen(5000, () => {
   logWithMumbaiTime('✅ Server running at http://localhost:5000');
 });
